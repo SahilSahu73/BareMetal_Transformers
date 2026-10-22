@@ -26,14 +26,20 @@ class Module:
     def __init__(self):
         self.params = {}
         self.grads = {}
+        self.children = {}
 
-    def named_parameters(self, prefix=""):
-        for k, v in self.params.items():
-            yield prefix + k, v, self.grads, k
+    def parameters(self, prefix=""):
+        """Flat {dotted.name: array}. Arrays are references, so updating them in place trains the model."""
+        out = {prefix + k: v for k, v in self.params.items()}
+        for name, child in self.children.items():
+            out.update(child.parameters(f"{prefix}{name}."))
+        return out
 
-    def zero_grad(self):
-        for k in self.params:
-            self.grads[k] = np.zeros_like(self.params[k])
+    def gradients(self, prefix=""):
+        out = {prefix + k: v for k, v in self.grads.items()}
+        for name, child in self.children.items():
+            out.update(child.gradients(f"{prefix}{name}."))
+        return out
 
 
 class Linear(Module):
