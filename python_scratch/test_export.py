@@ -103,17 +103,19 @@ def test_every_tensor_is_64_byte_aligned(tmp_path):
 
 def test_reference_file_layout(tmp_path):
     ids = np.arange(5)
-    a, b = np.random.rand(5, CFG.vocab), np.random.rand(5, CFG.vocab)
+    variants = [np.random.rand(5, CFG.vocab) for _ in range(3)]
     path = tmp_path / "r.bin"
-    write_reference(path, ids, a, b)
+    write_reference(path, ids, variants)
     raw = path.read_bytes()
-    assert struct.unpack_from("<4sII", raw, 0) == (b"BMRF", 5, CFG.vocab)
-    off = 12
+    assert struct.unpack_from("<4sIII", raw, 0) == (b"BMRF", 5, CFG.vocab, 3)
+    off = 16
     assert np.array_equal(np.frombuffer(raw, np.int32, 5, off), ids)
     off += 20
-    assert np.allclose(np.frombuffer(raw, np.float32, 5 * CFG.vocab, off).reshape(5, -1), a, atol=1e-7)
-    off += 4 * a.size
-    assert np.allclose(np.frombuffer(raw, np.float32, 5 * CFG.vocab, off).reshape(5, -1), b, atol=1e-7)
+    for v in variants:
+        got = np.frombuffer(raw, np.float32, 5 * CFG.vocab, off).reshape(5, -1)
+        assert np.allclose(got, v, atol=1e-7)
+        off += 4 * v.size
+    assert off == len(raw)
 
 
 def test_per_channel_beats_per_tensor_when_one_row_is_an_outlier():
@@ -121,3 +123,17 @@ def test_per_channel_beats_per_tensor_when_one_row_is_an_outlier():
     p["blocks.0.attn.wq.W"][:, 0] *= 50.0  # one output channel (column in (in,out) layout) is huge
     err = lambda q: np.abs(q["blocks.0.attn.wq.W"] - p["blocks.0.attn.wq.W"]).mean()
     assert err(fake_quantize(p, CFG)) < err(fake_quantize_per_tensor(p, CFG))
+
+
+def test_fake_quant_rows_matches_numpy_quantiser():
+    """The torch fake-quant that predicts the C++ activation/KV quantisation is the same function
+    as the exporter's per-row weight quantiser (scale = max|x|/127, round half to even)."""
+    import torch
+    from torch_model import fake_quant_rows
+    x = np.random.default_rng(3).standard_normal((6, 40)).astype(np.float32)
+    q, s = quantize_per_channel(x)
+    ref = dequantize(q, s)
+    got = fake_quant_rows(torch.tensor(x)).numpy()
+    assert np.abs(got - ref).max() < 1e-6
+    z = fake_quant_rows(torch.zeros(2, 8))
+    assert torch.all(z == 0)  # an all-zero row must not produce NaN (scale falls back to 1)

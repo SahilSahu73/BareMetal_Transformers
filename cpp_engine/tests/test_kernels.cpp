@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "kernels.hpp"
+#include "quantize.hpp"
 #include "testing.hpp"
 #include "tensor.hpp"
 #include "transformer.hpp"
@@ -271,6 +272,161 @@ static void test_simd_gemm_is_deterministic_across_thread_counts() {
   CHECK(c1 == c8);
 }
 
+// ---- INT8 --------------------------------------------------------------------------------------
+static std::vector<int8_t> rand_i8(size_t n, unsigned seed, bool extremes = false) {
+  std::mt19937 g(seed);
+  std::vector<int8_t> v(n);
+  for (auto& q : v) q = extremes ? ((g() & 1) ? 127 : -127) : static_cast<int8_t>(int(g() % 255) - 127);
+  return v;
+}
+
+static void test_quantize_properties() {
+  for (int n : {1, 3, 7, 8, 9, 16, 31, 64, 100}) {  // scalar tail, SIMD body, and both
+    auto x = randn(n, 200 + n);
+    std::vector<int8_t> q(n);
+    const float s = quantize_row_q8(x.data(), n, q.data());
+    float amax = 0;
+    for (float v : x) amax = std::max(amax, std::fabs(v));
+    CHECK_NEAR(s, amax / 127.f, 1e-7);
+    int maxq = 0;
+    for (int i = 0; i < n; ++i) {
+      CHECK(q[i] >= -127);  // -128 is never produced (it would break the vpmaddubsw trick)
+      maxq = std::max(maxq, std::abs(int(q[i])));
+      CHECK(std::fabs(q[i] * s - x[i]) <= s / 2 + 1e-6f);  // round-trip error bound
+    }
+    CHECK(maxq == 127);  // the largest element uses the full range
+  }
+  std::vector<float> z(20, 0.f);
+  std::vector<int8_t> qz(20, 5);
+  CHECK(quantize_row_q8(z.data(), 20, qz.data()) == 1.f);
+  for (auto q : qz) CHECK(q == 0);
+}
+
+static void test_quantize_rounds_half_to_even() {
+  // amax = 127 -> scale 1, so the values below are exact ties
+  for (int n : {10, 4}) {  // 10 exercises the SIMD loop (8 + tail), 4 the scalar path
+    std::vector<float> x(n, 0.f);
+    x[0] = 127.f; x[1] = 0.5f; x[2] = 1.5f; x[3] = 2.5f;
+    if (n > 4) { x[4] = -0.5f; x[5] = -1.5f; x[6] = -2.5f; x[7] = 3.5f; x[8] = -3.5f; }
+    std::vector<int8_t> q(n);
+    CHECK(quantize_row_q8(x.data(), n, q.data()) == 1.f);
+    CHECK(q[0] == 127 && q[1] == 0 && q[2] == 2 && q[3] == 2);
+    if (n > 4) CHECK(q[4] == 0 && q[5] == -2 && q[6] == -2 && q[7] == 4 && q[8] == -4);
+  }
+}
+
+static void test_quantize_matrix_is_per_row() {
+  const int R = 5, C = 21;
+  auto W = randn(R * C, 211);
+  for (int c = 0; c < C; ++c) W[2 * C + c] *= 100.f;  // one large row must not affect the others
+  std::vector<int8_t> Q(R * C);
+  std::vector<float> sc(R);
+  quantize_matrix_q8(W.data(), R, C, Q.data(), sc.data());
+  CHECK(sc[2] > 50.f * sc[0]);
+  for (int r = 0; r < R; ++r) {
+    int maxq = 0;
+    for (int c = 0; c < C; ++c) maxq = std::max(maxq, std::abs(int(Q[r * C + c])));
+    CHECK(maxq == 127);  // every row uses its own full range
+  }
+}
+
+static void test_gemv_q8_simd_matches_scalar() {
+  for (int nt : {1, 4}) {
+    set_num_threads(nt);
+    for (int N : {1, 3, 4, 5, 8, 33, 130})
+      for (int K : {1, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 513}) {
+        auto Q = rand_i8(size_t(N) * K, 300 + N + K);
+        auto sc = randn(N, 301);
+        for (auto& v : sc) v = std::fabs(v) * 0.01f + 0.001f;
+        auto x = randn(K, 302);
+        std::vector<float> a(N), b(N);
+        gemv_q8_naive(N, K, Q.data(), sc.data(), x.data(), a.data());
+        gemv_q8_simd(N, K, Q.data(), sc.data(), x.data(), b.data());
+        for (int i = 0; i < N; ++i) CHECK_NEAR(a[i], b[i], 1e-4 * (1 + std::fabs(a[i])));
+      }
+  }
+  set_num_threads(num_threads());
+}
+
+static void test_q8a8_gemv_and_gemm_match_scalar() {
+  for (int nt : {1, 4}) {
+    set_num_threads(nt);
+    for (int M : {1, 2, 3, 5, 8})
+      for (int N : {1, 3, 4, 5, 31, 32, 33, 70})
+        for (int K : {1, 31, 32, 33, 64, 100, 2048}) {
+          auto Xq = rand_i8(size_t(M) * K, 400 + M + K), Q = rand_i8(size_t(N) * K, 401 + N + K);
+          auto ws = randn(N, 402), xs = randn(M, 403);
+          for (auto& v : ws) v = std::fabs(v) * 0.01f + 0.001f;
+          for (auto& v : xs) v = std::fabs(v) * 0.01f + 0.001f;
+          std::vector<float> a(size_t(M) * N), b(size_t(M) * N);
+          gemm_nt_q8a8_naive(M, N, K, Xq.data(), xs.data(), Q.data(), ws.data(), a.data());
+          gemm_nt_q8a8_simd(M, N, K, Xq.data(), xs.data(), Q.data(), ws.data(), b.data());
+          for (size_t i = 0; i < a.size(); ++i) CHECK_NEAR(a[i], b[i], 1e-6 * (1 + std::fabs(a[i])));
+        }
+  }
+  set_num_threads(num_threads());
+}
+
+// The vpmaddubsw trick must never saturate: every operand at +-127 is the worst case.
+static void test_q8a8_extreme_values_do_not_saturate() {
+  const int N = 6, K = 2048;
+  std::vector<int8_t> Q = rand_i8(size_t(N) * K, 7, /*extremes=*/true), x(K, 127);
+  for (int k = 0; k < K; ++k) Q[k] = 127, Q[K + k] = -127;  // row 0 all +127, row 1 all -127
+  std::vector<float> ones(N, 1.f), y(N), ref(N);
+  gemv_q8a8_simd(N, K, Q.data(), ones.data(), x.data(), 1.f, y.data());
+  gemv_q8a8_naive(N, K, Q.data(), ones.data(), x.data(), 1.f, ref.data());
+  CHECK(y[0] == 127.f * 127.f * K);  // 33,030,144 = 2048 * 16129: no int16 saturation on the way
+  CHECK(y[1] == -127.f * 127.f * K);
+  for (int i = 0; i < N; ++i) CHECK(y[i] == ref[i]);
+
+  std::vector<int8_t> x2(size_t(2) * K, 127);  // the 2x4 GEMM micro-kernel has its own copy of the trick
+  const float xs2[2] = {1.f, 1.f};
+  std::vector<float> yg(size_t(2) * N);
+  gemm_nt_q8a8_simd(2, N, K, x2.data(), xs2, Q.data(), ones.data(), yg.data());
+  CHECK(yg[0] == y[0] && yg[N + 1] == y[1]);
+}
+
+static void test_gemm_nt_q8_dequant_pack_matches_fp32_reference() {
+  for (int nt : {1, 4}) {
+    set_num_threads(nt);
+    for (auto [M, N, K] : {std::tuple{2, 5, 7}, {7, 33, 100}, {13, 130, 300}, {40, 64, 513}, {1, 50, 64}}) {
+      auto W = randn(size_t(N) * K, 500 + N), X = randn(size_t(M) * K, 501 + M);
+      std::vector<int8_t> Q(size_t(N) * K);
+      std::vector<float> sc(N), Wd(size_t(N) * K);
+      quantize_matrix_q8(W.data(), N, K, Q.data(), sc.data());
+      for (int n = 0; n < N; ++n) dequantize_row_q8(Q.data() + size_t(n) * K, sc[n], K, Wd.data() + size_t(n) * K);
+      std::vector<float> Y(size_t(M) * N, -1.f);
+      gemm_nt_q8_simd(M, N, K, X.data(), Q.data(), sc.data(), Y.data());
+      CHECK(ref_gemm_err(M, N, K, X.data(), K, Wd.data(), K, true, Y.data(), N) <= 1.0);
+    }
+  }
+  set_num_threads(num_threads());
+}
+
+static void test_attention_helpers_match_scalar() {
+  for (int n : {1, 7, 8, 9, 16, 17, 64, 65}) {
+    auto a = randn(n, 700 + n), b = randn(n, 701 + n);
+    CHECK_NEAR(dot_f32(a.data(), b.data(), n), dot_f32_naive(a.data(), b.data(), n), 1e-4);
+    std::vector<float> y = randn(n, 702), y2 = y;
+    axpy_f32(y.data(), -0.61f, a.data(), n);
+    axpy_f32_naive(y2.data(), -0.61f, a.data(), n);
+    for (int i = 0; i < n; ++i) CHECK_NEAR(y[i], y2[i], 1e-5);
+  }
+}
+
+static void test_kv_int8_helpers() {
+  for (int n : {1, 7, 8, 9, 64, 65}) {
+    auto a = randn(n, 600 + n);
+    auto q = rand_i8(n, 601 + n);
+    double ref = 0;
+    for (int i = 0; i < n; ++i) ref += double(a[i]) * q[i];
+    CHECK_NEAR(dot_f32_i8(a.data(), q.data(), n), ref, 1e-3);
+    std::vector<float> y = randn(n, 602), y0 = y;
+    axpy_f32_i8(y.data(), 0.37f, q.data(), n);
+    for (int i = 0; i < n; ++i) CHECK_NEAR(y[i], y0[i] + 0.37 * q[i], 1e-4);
+  }
+}
+
 int main() {
   RUN(test_gemm_naive_matches_double_reference);
   RUN(test_gemv_matches_gemm_with_one_column);
@@ -285,5 +441,14 @@ int main() {
   RUN(test_gemv_simd_all_shapes);
   RUN(test_gemm_nt_kernels_agree);
   RUN(test_simd_gemm_is_deterministic_across_thread_counts);
+  RUN(test_quantize_properties);
+  RUN(test_quantize_rounds_half_to_even);
+  RUN(test_quantize_matrix_is_per_row);
+  RUN(test_gemv_q8_simd_matches_scalar);
+  RUN(test_q8a8_gemv_and_gemm_match_scalar);
+  RUN(test_q8a8_extreme_values_do_not_saturate);
+  RUN(test_gemm_nt_q8_dequant_pack_matches_fp32_reference);
+  RUN(test_attention_helpers_match_scalar);
+  RUN(test_kv_int8_helpers);
   return finish();
 }

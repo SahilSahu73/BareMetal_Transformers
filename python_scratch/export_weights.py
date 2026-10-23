@@ -129,15 +129,23 @@ def from_file_layout(tensors):
     return {k: (v.T if k.endswith(".W") else v) for k, v in tensors.items()}
 
 
-def write_reference(path, ids, logits_fp32, logits_int8):
-    """Reference for the C++ tests: token ids plus the logits PyTorch produces for them
-    (FP32 weights, and INT8 weights dequantised = what W8A32 kernels should reproduce)."""
-    n, v = logits_fp32.shape
+REFERENCE_VARIANTS = ["fp32", "w8", "w8a8", "w8kv8", "fp32kv8"]
+
+
+def write_reference(path, ids, variants):
+    """Reference for the C++ tests: token ids plus the logits PyTorch produces for them under each
+    numeric variant (see REFERENCE_VARIANTS):
+        fp32     FP32 weights                          w8a8    INT8 weights, INT8 activations
+        w8       INT8 weights (dequantised), FP32 acts  w8kv8   INT8 weights + INT8 KV-cache
+        fp32kv8  FP32 weights + INT8 KV-cache
+    Layout: "BMRF" | n u32 | vocab u32 | n_variants u32 | int32 ids[n] | float32 logits[n, vocab] per variant.
+    """
+    n, v = variants[0].shape
     with open(path, "wb") as f:
-        f.write(struct.pack("<4sII", REF_MAGIC, n, v))
+        f.write(struct.pack("<4sIII", REF_MAGIC, n, v, len(variants)))
         f.write(np.asarray(ids, np.int32).tobytes())
-        f.write(np.ascontiguousarray(logits_fp32, np.float32).tobytes())
-        f.write(np.ascontiguousarray(logits_int8, np.float32).tobytes())
+        for logits in variants:
+            f.write(np.ascontiguousarray(logits, np.float32).tobytes())
 
 
 def load_checkpoint(path, config_name):
@@ -161,11 +169,12 @@ def fake_quantize(params, cfg):
     return out
 
 
-def reference_logits(cfg, params, ids):
+def reference_logits(cfg, params, ids, act=False, kv=False):
     import torch
     from torch_model import TorchGPT
     model = TorchGPT(cfg).double()
     model.load_state_dict({k: torch.tensor(v, dtype=torch.float64) for k, v in params.items()})
+    model.set_quant(act=act, kv=kv)
     with torch.no_grad():
         return model(torch.tensor(ids)[None])[0].numpy()
 
@@ -195,8 +204,14 @@ def main():
     _, val = load_tinyshakespeare()
     ids = val[:min(32, cfg.max_seq)]
     ref_path = os.path.join(args.output_dir, f"{stem}_reference.bin")
-    write_reference(ref_path, ids, reference_logits(cfg, params, ids),
-                    reference_logits(cfg, fake_quantize(params, cfg), ids))
+    q = fake_quantize(params, cfg)
+    write_reference(ref_path, ids, [
+        reference_logits(cfg, params, ids),
+        reference_logits(cfg, q, ids),
+        reference_logits(cfg, q, ids, act=True),
+        reference_logits(cfg, q, ids, kv=True),
+        reference_logits(cfg, params, ids, kv=True),
+    ])
     val.astype(np.uint8).tofile(os.path.join(args.output_dir, "val_tokens.bin"))
     print(f"{ref_path}: {len(ids)} reference tokens (+ val_tokens.bin for perplexity checks)")
 

@@ -17,6 +17,8 @@ add_library(bm STATIC
   src/kernels_naive.cpp
   src/kernels_tiled.cpp
   src/kernels_simd.cpp
+  src/kernels_int8.cpp
+  src/quantize.cpp
   src/ops.cpp
   src/transformer.cpp)
 target_include_directories(bm PUBLIC include)
@@ -67,5 +69,8 @@ target_link_libraries(benchmark_transformer PRIVATE bm)
 #       --ckpt checkpoints/random_small.pt --name small_random --quantize-int8
 add_test(NAME reference_logits_small_shape
   COMMAND test_reference ${CKPT_DIR}/small_random_fp32.bin ${CKPT_DIR}/small_random_int8.bin
-                         ${CKPT_DIR}/small_random_reference.bin)
+                         ${CKPT_DIR}/small_random_reference.bin --smooth-only)
 set_tests_properties(reference_logits_small_shape PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(eval_perplexity src/eval_perplexity.cpp)
+target_link_libraries(eval_perplexity PRIVATE bm)

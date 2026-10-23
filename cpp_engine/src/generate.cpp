@@ -15,6 +15,7 @@ void usage() {
   std::fprintf(stderr,
                "usage: generate --weights FILE [--prompt TEXT] [-n TOKENS] [--temp T] [--top-k K]\n"
                "                [--top-p P] [--seed S] [--threads T] [--kernels fast|naive]\n"
+               "                [--act w8a32|w8a8] [--kv-int8]   (INT8 model files only / KV-cache precision)\n"
                "  --temp 0 selects greedy decoding. Tokens are raw bytes (byte-level vocabulary).\n");
 }
 
@@ -26,7 +27,8 @@ int main(int argc, char** argv) {
   float temp = 0.8f, top_p = 1.0f;
   uint64_t seed = 1;
   int threads = bm::physical_cores();
-  bool naive = false;
+  bool naive = false, kv_int8 = false;
+  bm::ActMode act = bm::ActMode::F32;
 
   for (int i = 1; i < argc; ++i) {
     auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0 && i + 1 < argc; };
@@ -39,6 +41,8 @@ int main(int argc, char** argv) {
     else if (arg("--seed")) seed = std::strtoull(argv[++i], nullptr, 10);
     else if (arg("--threads")) threads = std::atoi(argv[++i]);
     else if (arg("--kernels")) naive = std::strcmp(argv[++i], "naive") == 0;
+    else if (arg("--act")) act = std::strcmp(argv[++i], "w8a8") == 0 ? bm::ActMode::Q8 : bm::ActMode::F32;
+    else if (std::strcmp(argv[i], "--kv-int8") == 0) kv_int8 = true;
     else { usage(); return 1; }
   }
   if (weights.empty()) { usage(); return 1; }
@@ -46,13 +50,17 @@ int main(int argc, char** argv) {
   try {
     bm::ModelFile model(weights);
     bm::set_num_threads(threads);
-    bm::Transformer net(model, naive ? bm::naive_kernels() : bm::optimized_kernels());
+    bm::TransformerOptions opt;
+    opt.kernels = naive ? bm::naive_kernels() : bm::optimized_kernels();
+    opt.act = act;
+    opt.kv_int8 = kv_int8;
+    bm::Transformer net(model, opt);
     bm::Sampler sampler(model.cfg.vocab, temp, top_k, top_p, seed);
     const int max_seq = model.cfg.max_seq;
 
-    std::fprintf(stderr, "%s | %d layers, d=%d, %d heads | %.2f MB weights, %.2f MB KV-cache | %s kernels, %d threads\n",
-                 model.int8 ? "INT8" : "FP32", model.cfg.n_layers, model.cfg.d_model, model.cfg.n_heads,
-                 model.file_bytes() / 1e6, net.kv_cache_bytes() / 1e6, naive ? "naive" : bm::simd_isa(), threads);
+    std::fprintf(stderr, "%s | %d layers, d=%d, %d heads | %.2f MB weights, %.2f MB KV-cache (%s) | %s kernels, %d threads\n",
+                 !model.int8 ? "FP32" : act == bm::ActMode::Q8 ? "INT8 W8A8" : "INT8 W8A32", model.cfg.n_layers, model.cfg.d_model, model.cfg.n_heads,
+                 model.file_bytes() / 1e6, net.kv_cache_bytes() / 1e6, kv_int8 ? "int8" : "fp32", naive ? "naive" : bm::simd_isa(), threads);
 
     using clock = std::chrono::steady_clock;
     const float* logits = nullptr;

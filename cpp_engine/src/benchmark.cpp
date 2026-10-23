@@ -1,5 +1,6 @@
 // Microbenchmark suite: ceilings first (what the CPU can do), then each kernel against them.
 //   benchmark_transformer [--all] [--peak] [--gemm] [--gemv] [--scaling] [--sweep]
+//                         [--e2e --models fp32.bin [int8.bin ...]]
 //                         [--size N] [--threads T] [--reps R] [--naive-max N] [--csv FILE]
 #include <algorithm>
 #include <chrono>
@@ -13,7 +14,9 @@
 #include <vector>
 
 #include "kernels.hpp"
+#include "quantize.hpp"
 #include "tensor.hpp"
+#include "transformer.hpp"
 
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
@@ -30,7 +33,8 @@ using clk = std::chrono::steady_clock;
 namespace {
 
 struct Options {
-  bool peak = false, gemm = false, gemv = false, scaling = false, sweep = false;
+  bool peak = false, gemm = false, gemv = false, scaling = false, sweep = false, e2e = false;
+  std::vector<std::string> models;
   int size = 1024, reps = 7;
   int naive_max = 1024;
   int threads = 0;  // 0 = physical cores
@@ -185,47 +189,63 @@ double max_rel_err(const std::vector<float>& a, const std::vector<float>& ref) {
   return mx / scale;
 }
 
-struct GemmCase {
-  std::string name;
-  int threads;
-  std::function<void(int, int, int, const float*, const float*, float*)> fn;
-  bool slow;  // skipped above --naive-max
-};
-
 void run_gemm(const Options& o, int nthreads) {
   const int N = o.size;
   const double flops = 2.0 * N * N * N;
-  std::printf("\n== GEMM %dx%dx%d  (FP32, %s, tile %dx%d) ==\n", N, N, N, simd_isa(), micro_tile_m(), micro_tile_n());
-  auto A = randn(size_t(N) * N, 1), B = randn(size_t(N) * N, 2);
-  std::vector<float> C(size_t(N) * N), ref(size_t(N) * N);
+  std::printf("\n== GEMM %dx%dx%d  (%s, tile %dx%d) ==\n", N, N, N, simd_isa(), micro_tile_m(), micro_tile_n());
+  const size_t NN = size_t(N) * N;
+  auto A = randn(NN, 1), B = randn(NN, 2);
+  std::vector<float> C(NN), ref(NN);
   set_num_threads(1);
   gemm_simd(N, N, N, A.data(), B.data(), ref.data());
 
-  const std::vector<GemmCase> cases = {
-      {"1. naive i-j-k", 1, [](int M, int N, int K, const float* a, const float* b, float* c) { gemm_naive(M, N, K, a, b, c); }, true},
-      {"2. reordered i-k-j", 1, [](int M, int N, int K, const float* a, const float* b, float* c) { gemm_reordered(M, N, K, a, b, c); }, true},
-      {"3. reordered + tiled 64", 1, [](int M, int N, int K, const float* a, const float* b, float* c) { gemm_tiled(M, N, K, a, b, c, 64); }, false},
-      {"4. packed micro-kernel (1 thread)", 1, [](int M, int N, int K, const float* a, const float* b, float* c) { gemm_simd(M, N, K, a, b, c); }, false},
-      {"5. packed micro-kernel + OpenMP", nthreads, [](int M, int N, int K, const float* a, const float* b, float* c) { gemm_simd(M, N, K, a, b, c); }, false},
+  // INT8 operands: Wf is a weight matrix W[N,K] quantised per output row; A is quantised per token row.
+  auto Wf = randn(NN, 3);
+  std::vector<int8_t> Wq(NN), Aq(NN);
+  std::vector<float> ws(N), as(N), Wdeq(NN), ref_w8(NN), ref_w8a8(NN), Cq(NN);
+  quantize_matrix_q8(Wf.data(), N, N, Wq.data(), ws.data());
+  quantize_matrix_q8(A.data(), N, N, Aq.data(), as.data());
+  for (int n = 0; n < N; ++n) dequantize_row_q8(Wq.data() + size_t(n) * N, ws[n], N, Wdeq.data() + size_t(n) * N);
+  gemm_simd(N, N, N, A.data(), Wdeq.data(), ref_w8.data(), true);
+  gemm_nt_q8a8_simd(N, N, N, Aq.data(), as.data(), Wq.data(), ws.data(), ref_w8a8.data());
+
+  struct Case { std::string name; int threads; std::function<void()> run; bool slow, fp32; std::vector<float>* out; const std::vector<float>* want; };
+  const std::vector<Case> cases = {
+      {"1. naive i-j-k", 1, [&] { gemm_naive(N, N, N, A.data(), B.data(), C.data()); }, true, true, &C, &ref},
+      {"2. reordered i-k-j", 1, [&] { gemm_reordered(N, N, N, A.data(), B.data(), C.data()); }, true, true, &C, &ref},
+      {"3. reordered + tiled 64", 1, [&] { gemm_tiled(N, N, N, A.data(), B.data(), C.data(), 64); }, false, true, &C, &ref},
+      {"4. packed micro-kernel (1 thread)", 1, [&] { gemm_simd(N, N, N, A.data(), B.data(), C.data()); }, false, true, &C, &ref},
+      {"5. packed micro-kernel + OpenMP", nthreads, [&] { gemm_simd(N, N, N, A.data(), B.data(), C.data()); }, false, true, &C, &ref},
+      {"6. W8A32 dequant-on-pack (1 thread)", 1, [&] { gemm_nt_q8_simd(N, N, N, A.data(), Wq.data(), ws.data(), Cq.data()); }, false, false, &Cq, &ref_w8},
+      {"7. W8A32 dequant-on-pack + OpenMP", nthreads, [&] { gemm_nt_q8_simd(N, N, N, A.data(), Wq.data(), ws.data(), Cq.data()); }, false, false, &Cq, &ref_w8},
+      {"8. W8A8 int8 dot (1 thread)", 1, [&] { gemm_nt_q8a8_simd(N, N, N, Aq.data(), as.data(), Wq.data(), ws.data(), Cq.data()); }, false, false, &Cq, &ref_w8a8},
+      {"9. W8A8 int8 dot + OpenMP", nthreads, [&] { gemm_nt_q8a8_simd(N, N, N, Aq.data(), as.data(), Wq.data(), ws.data(), Cq.data()); }, false, false, &Cq, &ref_w8a8},
   };
-  struct Row { std::string name; int threads; double ms, gf; bool ok; };
+  struct Row { std::string name; int threads; double ms, gf; bool ok, fp32; };
   std::vector<Row> rows;
   for (const auto& k : cases) {
     if (k.slow && N > o.naive_max && k.name[0] == '1') continue;
     sample_peak(nthreads);
     set_num_threads(k.threads);
-    const double ms = time_ms([&] { k.fn(N, N, N, A.data(), B.data(), C.data()); }, k.slow ? 3 : o.reps);
+    const double ms = time_ms(k.run, k.slow ? 3 : o.reps);
     sample_peak(nthreads);
-    rows.push_back({k.name, k.threads, ms, flops / ms / 1e6, max_rel_err(C, ref) < 1e-4});
+    rows.push_back({k.name, k.threads, ms, flops / ms / 1e6, max_rel_err(*k.out, *k.want) < 1e-4, k.fp32});
   }
-  std::printf("%-36s %8s %10s %10s %9s %9s %s\n", "kernel", "threads", "time (ms)", "GFLOPS", "speedup", "% peak", "check");
+  auto packed_ms = [&](int threads) {  // FP32 packed kernel at the same thread count, for the INT8 comparison
+    for (const auto& r : rows) if (r.fp32 && r.name[0] >= '4' && r.name[0] <= '5' && r.threads == threads) return r.ms;
+    return 0.0;
+  };
+  std::printf("%-38s %7s %10s %9s %9s %9s %12s %s\n", "kernel", "threads", "time (ms)", "GFLOPS", "speedup", "% fp32 pk", "vs fp32 pack", "check");
   for (const auto& r : rows) {
     const double peak = g_peak[r.threads == 1 ? 0 : 1];
-    std::printf("%-36s %8d %10.2f %10.2f %8.1fx %8.1f%% %s\n", r.name.c_str(), r.threads, r.ms, r.gf,
-                rows[0].ms / r.ms, 100.0 * r.gf / peak, r.ok ? "ok" : "MISMATCH");
+    char pct[16] = "      -", vs[16] = "          -";
+    if (r.fp32) std::snprintf(pct, sizeof pct, "%8.1f%%", 100.0 * r.gf / peak);
+    else if (packed_ms(r.threads) > 0) std::snprintf(vs, sizeof vs, "%10.2fx", packed_ms(r.threads) / r.ms);
+    std::printf("%-38s %7d %10.2f %9.2f %8.1fx %9s %12s %s\n", r.name.c_str(), r.threads, r.ms, r.gf, rows[0].ms / r.ms, pct, vs, r.ok ? "ok" : "MISMATCH");
     csv_row("gemm", r.name, std::to_string(N), r.threads, r.ms, r.gf, 0);
   }
-  std::printf("  (peak = highest FMA throughput observed: %.1f GFLOPS x1 thread, %.1f x%d threads)\n", g_peak[0], g_peak[1], nthreads);
+  std::printf("  (peak = highest FP32 FMA throughput observed: %.1f GFLOPS x1 thread, %.1f x%d threads; INT8 rows count the same 2*N^3 ops)\n",
+              g_peak[0], g_peak[1], nthreads);
   set_num_threads(nthreads);
 }
 
@@ -250,36 +270,63 @@ void run_scaling(const Options& o) {
 void run_gemv(const Options& o, double bw, int nthreads) {
   std::printf("\n== GEMV  y = W x  (the decode path), DRAM read bandwidth %.1f GB/s ==\n", bw);
   std::printf("hot  = the same matrix every call (stays in L2/L3); cold = rotating through >=160 MB of\n"
-              "matrices so every call streams from DRAM, like a real model whose weights exceed the cache.\n");
-  std::printf("%-10s %-15s %4s | %9s %8s | %9s %8s %7s\n", "N x K", "kernel", "thr", "hot us", "GB/s", "cold us", "GB/s", "%DRAM");
+              "matrices so every call streams from DRAM, like a real model whose weights exceed the cache.\n"
+              "GB/s counts the bytes actually read (4 per FP32 weight, 1 per INT8 weight). 'vs fp32' = cold time ratio, same threads.\n");
+  std::printf("%-10s %-22s %4s | %8s %7s | %8s %7s %6s | %7s\n", "N x K", "kernel", "thr", "hot us", "GB/s", "cold us", "GB/s", "%DRAM", "vs fp32");
   struct Shape { int n, k; };
   for (auto s : {Shape{512, 512}, Shape{2048, 512}, Shape{512, 2048}, Shape{8192, 8192}}) {
     const size_t elems = size_t(s.n) * s.k;
-    const int copies = int(std::max<size_t>(2, (size_t(160) << 20) / (elems * 4)));
-    std::vector<float> big(elems * copies);
+    const int copies32 = int(std::max<size_t>(2, (size_t(160) << 20) / (elems * 4)));
+    const int copies8 = int(std::max<size_t>(2, (size_t(160) << 20) / elems));
+    std::vector<float> big32(elems * copies32);
+    std::vector<int8_t> big8(elems * copies8);
     auto first = randn(elems, 3);
-    for (int c = 0; c < copies; ++c) std::memcpy(big.data() + elems * c, first.data(), elems * 4);
+    std::vector<float> wscales(s.n);
+    std::vector<int8_t> q8(elems);
+    quantize_matrix_q8(first.data(), s.n, s.k, q8.data(), wscales.data());
+    for (int c = 0; c < copies32; ++c) std::memcpy(big32.data() + elems * c, first.data(), elems * 4);
+    for (int c = 0; c < copies8; ++c) std::memcpy(big8.data() + elems * c, q8.data(), elems);
     auto x = randn(s.k, 4);
-    std::vector<float> y(s.n), ref(s.n);
-    gemv_f32_naive(s.n, s.k, first.data(), x.data(), ref.data());
-    struct K { const char* name; int threads; GemvF32 fn; };
-    for (auto k : {K{"naive", 1, gemv_f32_naive}, K{"simd", 1, gemv_f32_simd}, K{"simd + OpenMP", nthreads, gemv_f32_simd}}) {
-      set_num_threads(k.threads);
-      const int reps = (elems * 4 >= (64u << 20) && k.threads == 1 && k.name[1] == 'a') ? 3 : o.reps * 4;
-      const double hot = time_ms([&] { k.fn(s.n, s.k, first.data(), x.data(), y.data()); }, reps);
+    std::vector<int8_t> xq(s.k);
+    const float xs = quantize_row_q8(x.data(), s.k, xq.data());
+
+    std::vector<float> y(s.n), ref32(s.n), refq(s.n), refqq(s.n);
+    gemv_f32_naive(s.n, s.k, first.data(), x.data(), ref32.data());
+    gemv_q8_naive(s.n, s.k, q8.data(), wscales.data(), x.data(), refq.data());
+    gemv_q8a8_naive(s.n, s.k, q8.data(), wscales.data(), xq.data(), xs, refqq.data());
+
+    struct V { const char* name; int threads; bool fp32; double bytes; const std::vector<float>* want; std::function<void(int)> run; };
+    const std::vector<V> variants = {
+        {"fp32 naive", 1, true, 4, &ref32, [&](int i) { gemv_f32_naive(s.n, s.k, big32.data() + elems * (i % copies32), x.data(), y.data()); }},
+        {"fp32 simd", 1, true, 4, &ref32, [&](int i) { gemv_f32_simd(s.n, s.k, big32.data() + elems * (i % copies32), x.data(), y.data()); }},
+        {"fp32 simd + OpenMP", nthreads, true, 4, &ref32, [&](int i) { gemv_f32_simd(s.n, s.k, big32.data() + elems * (i % copies32), x.data(), y.data()); }},
+        {"int8 W8A32 simd", 1, false, 1, &refq, [&](int i) { gemv_q8_simd(s.n, s.k, big8.data() + elems * (i % copies8), wscales.data(), x.data(), y.data()); }},
+        {"int8 W8A32 + OpenMP", nthreads, false, 1, &refq, [&](int i) { gemv_q8_simd(s.n, s.k, big8.data() + elems * (i % copies8), wscales.data(), x.data(), y.data()); }},
+        {"int8 W8A8 simd", 1, false, 1, &refqq, [&](int i) { gemv_q8a8_simd(s.n, s.k, big8.data() + elems * (i % copies8), wscales.data(), xq.data(), xs, y.data()); }},
+        {"int8 W8A8 + OpenMP", nthreads, false, 1, &refqq, [&](int i) { gemv_q8a8_simd(s.n, s.k, big8.data() + elems * (i % copies8), wscales.data(), xq.data(), xs, y.data()); }},
+    };
+    char shape[32];
+    std::snprintf(shape, sizeof shape, "%dx%d", s.n, s.k);
+    double fp32_cold[2] = {0, 0};  // simd fp32 cold time at 1 thread / N threads
+    for (const auto& v : variants) {
+      set_num_threads(v.threads);
+      const int reps = (elems >= (size_t(32) << 20) && v.name[0] == 'f' && v.name[5] == 'n') ? 3 : o.reps * 4;
+      const double hot = time_ms([&] { v.run(0); }, reps);
       int idx = 0;
-      const double cold = time_ms([&] { k.fn(s.n, s.k, big.data() + elems * (idx++ % copies), x.data(), y.data()); }, reps);
-      const double ghot = elems * 4 / hot / 1e6, gcold = elems * 4 / cold / 1e6;
-      char shape[32];
-      std::snprintf(shape, sizeof shape, "%dx%d", s.n, s.k);
-      std::printf("%-10s %-15s %4d | %9.1f %8.1f | %9.1f %8.1f %6.0f%% %s\n", shape, k.name, k.threads, hot * 1000, ghot,
-                  cold * 1000, gcold, 100 * gcold / bw, max_rel_err(y, ref) < 1e-4 ? "" : "MISMATCH");
-      csv_row("gemv_hot", k.name, shape, k.threads, hot, 0, ghot);
-      csv_row("gemv_cold", k.name, shape, k.threads, cold, 0, gcold);
+      const double cold = time_ms([&] { v.run(idx++); }, reps);
+      const double ghot = elems * v.bytes / hot / 1e6, gcold = elems * v.bytes / cold / 1e6;
+      if (v.fp32 && v.name[5] == 's') fp32_cold[v.threads == 1 ? 0 : 1] = cold;
+      char vs[16] = "       -";
+      if (!v.fp32) std::snprintf(vs, sizeof vs, "%6.2fx", fp32_cold[v.threads == 1 ? 0 : 1] / cold);
+      std::printf("%-10s %-22s %4d | %8.1f %7.1f | %8.1f %7.1f %5.0f%% | %7s %s\n", shape, v.name, v.threads, hot * 1000, ghot,
+                  cold * 1000, gcold, 100 * gcold / bw, vs, max_rel_err(y, *v.want) < 1e-4 ? "" : "MISMATCH");
+      csv_row("gemv_hot", v.name, shape, v.threads, hot, 0, ghot);
+      csv_row("gemv_cold", v.name, shape, v.threads, cold, 0, gcold);
     }
   }
+  set_num_threads(nthreads);
 
-  std::printf("\n-- thread count vs. GEMV, 2048x512 (4 MB: hot) --\n");
+  std::printf("\n-- thread count vs. GEMV, 2048x512 fp32 (4 MB: hot) --\n");
   auto W = randn(size_t(2048) * 512, 5), x = randn(512, 6);
   std::vector<float> y(2048);
   const size_t saved = gemv_parallel_threshold();
@@ -290,6 +337,80 @@ void run_gemv(const Options& o, double bw, int nthreads) {
     std::printf("  %2d threads: %8.1f us  (%.1f GB/s)\n", t, ms * 1000, 2048.0 * 512 * 4 / ms / 1e6);
   }
   gemv_parallel_threshold() = saved;
+  set_num_threads(nthreads);
+}
+
+// ---- end to end: prefill and decode on real model files ---------------------------------------
+void run_e2e(const Options& o, int nthreads) {
+  std::printf("\n== end-to-end generation (prefill = one batched pass over the prompt; decode = greedy, 1 token/step) ==\n");
+  std::printf("%-30s %-24s %4s | %7s %7s | %9s %10s | %9s %9s\n", "model", "mode", "thr", "wt MB", "KV MB", "prefill ms", "prefill t/s", "ms/token", "tokens/s");
+  for (const auto& path : o.models) {
+    bm::ModelFile model(path);
+    const int P = std::min(128, model.cfg.max_seq / 2), G = std::min(100, model.cfg.max_seq - P);
+    std::vector<int> prompt(P);
+    for (int i = 0; i < P; ++i) prompt[i] = (i * 7 + 13) % model.cfg.vocab;
+    const std::string base = path.substr(path.find_last_of('/') + 1);
+
+    struct Cfg { const char* name; bool naive; int threads; bm::ActMode act; bool kv8; };
+    std::vector<Cfg> cfgs;
+    if (!model.int8)
+      cfgs = {{"fp32 naive kernels", true, 1, bm::ActMode::F32, false},
+              {"fp32 optimised", false, 1, bm::ActMode::F32, false},
+              {"fp32 optimised", false, nthreads, bm::ActMode::F32, false},
+              {"fp32 optimised + KV int8", false, nthreads, bm::ActMode::F32, true}};
+    else
+      cfgs = {{"int8 W8A32 naive kernels", true, 1, bm::ActMode::F32, false},
+              {"int8 W8A32 optimised", false, 1, bm::ActMode::F32, false},
+              {"int8 W8A32 optimised", false, nthreads, bm::ActMode::F32, false},
+              {"int8 W8A8 optimised", false, nthreads, bm::ActMode::Q8, false},
+              {"int8 W8A32 + KV int8", false, nthreads, bm::ActMode::F32, true},
+              {"int8 W8A8 + KV int8", false, nthreads, bm::ActMode::Q8, true}};
+
+    for (const auto& c : cfgs) {
+      set_num_threads(c.threads);
+      bm::TransformerOptions opt;
+      opt.kernels = c.naive ? bm::naive_kernels() : bm::optimized_kernels();
+      opt.act = c.act;
+      opt.kv_int8 = c.kv8;
+      bm::Transformer net(model, opt);
+      const int reps = c.naive ? 1 : std::max(3, o.reps / 2);
+      double best_pre = 1e30, best_dec = 1e30;
+      for (int r = 0; r < reps + (c.naive ? 0 : 1); ++r) {  // first run of the fast configs is warm-up
+        net.reset();
+        const auto t0 = clk::now();
+        const float* l = net.prefill(prompt.data(), P);
+        const auto t1 = clk::now();
+        for (int g = 0; g < G; ++g) l = net.forward(int(std::max_element(l, l + model.cfg.vocab) - l));
+        const auto t2 = clk::now();
+        if (r == 0 && !c.naive) continue;
+        best_pre = std::min(best_pre, std::chrono::duration<double, std::milli>(t1 - t0).count());
+        best_dec = std::min(best_dec, std::chrono::duration<double, std::milli>(t2 - t1).count() / G);
+      }
+      std::printf("%-30s %-24s %4d | %7.1f %7.2f | %9.1f %10.0f | %9.3f %9.1f\n", base.c_str(), c.name, c.threads, model.file_bytes() / 1e6,
+                  net.kv_cache_bytes() / 1e6, best_pre, P * 1000.0 / best_pre, best_dec, 1000.0 / best_dec);
+      csv_row("e2e_prefill", base + " | " + c.name, std::to_string(P), c.threads, best_pre, 0, 0);
+      csv_row("e2e_decode", base + " | " + c.name, std::to_string(G), c.threads, best_dec, 0, 0);
+    }
+
+    std::printf("   decode ms/token vs threads (%s):", base.c_str());
+    for (int t : {1, 2, 4, 8, 16}) {
+      set_num_threads(t);
+      bm::TransformerOptions opt;
+      opt.kernels = bm::optimized_kernels();
+      bm::Transformer net(model, opt);
+      double best = 1e30;
+      for (int r = 0; r < 3; ++r) {
+        net.reset();
+        const float* l = net.prefill(prompt.data(), P);
+        const auto t1 = clk::now();
+        for (int g = 0; g < G; ++g) l = net.forward(int(std::max_element(l, l + model.cfg.vocab) - l));
+        best = std::min(best, std::chrono::duration<double, std::milli>(clk::now() - t1).count() / G);
+      }
+      std::printf("  %dT %.3f", t, best);
+      csv_row("e2e_threads", base, std::to_string(t), t, best, 0, 0);
+    }
+    std::printf("\n");
+  }
   set_num_threads(nthreads);
 }
 
@@ -338,6 +459,8 @@ int main(int argc, char** argv) {
     else if (is("--gemv")) o.gemv = true;
     else if (is("--scaling")) o.scaling = true;
     else if (is("--sweep")) o.sweep = true;
+    else if (is("--e2e")) o.e2e = true;
+    else if (is("--models")) { while (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0) o.models.push_back(argv[++i]); }
     else if (is("--size")) o.size = std::atoi(next());
     else if (is("--threads")) o.threads = std::atoi(next());
     else if (is("--reps")) o.reps = std::atoi(next());
@@ -371,6 +494,10 @@ int main(int argc, char** argv) {
   if (o.gemv) run_gemv(o, bw, nthreads);
   if (o.scaling) run_scaling(o);
   if (o.sweep) run_sweep(o);
+  if (o.e2e) {
+    if (o.models.empty()) std::fprintf(stderr, "--e2e needs --models file.bin [...]\n");
+    else run_e2e(o, nthreads);
+  }
   if (g_csv) std::fclose(g_csv);
   return 0;
 }

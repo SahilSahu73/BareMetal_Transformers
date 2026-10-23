@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from data import load_tinyshakespeare
-from export_weights import (dequantize, fake_quantize, is_matrix, load_checkpoint,
+from export_weights import (fake_quantize, is_matrix, load_checkpoint,
                             tensor_names, to_file_layout, from_file_layout, quantize_per_channel)
 from torch_model import TorchGPT
 from transformer import CONFIGS
@@ -29,9 +29,10 @@ def fake_quantize_per_tensor(params, cfg):
 
 
 @torch.no_grad()
-def perplexity(cfg, params, val, batch=16):
+def perplexity(cfg, params, val, batch=16, act=False, kv=False):
     model = TorchGPT(cfg)
     model.load_state_dict({k: torch.tensor(v) for k, v in params.items()})
+    model.set_quant(act=act, kv=kv)
     T = cfg.max_seq
     n = (len(val) - 1) // T
     x = torch.from_numpy(val[:n * T].reshape(n, T)).long()
@@ -51,13 +52,22 @@ def main():
     cfg, params = load_checkpoint(args.ckpt, args.config)
     _, val = load_tinyshakespeare()
 
+    q = fake_quantize(params, cfg)
     base, n_tok = perplexity(cfg, params, val)
     print(f"validation tokens: {n_tok:,}")
-    print(f"{'FP32':28s} ppl {base:8.4f}")
-    for label, fn in [("INT8 per-channel", fake_quantize), ("INT8 per-tensor", fake_quantize_per_tensor)]:
-        ppl, _ = perplexity(cfg, fn(params, cfg), val)
-        print(f"{label:28s} ppl {ppl:8.4f}   delta {100 * (ppl - base) / base:+.3f}%")
-
+    rows = [
+        ("FP32", params, {}),
+        ("INT8 weights, per-channel (W8A32)", q, {}),
+        ("INT8 weights, per-tensor", fake_quantize_per_tensor(params, cfg), {}),
+        ("INT8 weights + INT8 activations (W8A8)", q, {"act": True}),
+        ("FP32 weights + INT8 KV-cache", params, {"kv": True}),
+        ("INT8 weights + INT8 KV-cache", q, {"kv": True}),
+        ("W8A8 + INT8 KV-cache", q, {"act": True, "kv": True}),
+    ]
+    for label, p, kw in rows:
+        ppl = base if label == "FP32" else perplexity(cfg, p, val, **kw)[0]
+        delta = "" if label == "FP32" else f"   delta {100 * (ppl - base) / base:+.3f}%"
+        print(f"{label:42s} ppl {ppl:8.4f}{delta}")
 
 if __name__ == "__main__":
     main()

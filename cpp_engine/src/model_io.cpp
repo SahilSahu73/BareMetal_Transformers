@@ -132,20 +132,21 @@ Reference load_reference(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) throw std::runtime_error("cannot open " + path);
   char magic[4];
-  uint32_t n = 0, v = 0;
-  if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "BMRF", 4) != 0 ||
-      std::fread(&n, 4, 1, f) != 1 || std::fread(&v, 4, 1, f) != 1) {
+  uint32_t n = 0, v = 0, nv = 0;
+  if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "BMRF", 4) != 0 || std::fread(&n, 4, 1, f) != 1 ||
+      std::fread(&v, 4, 1, f) != 1 || std::fread(&nv, 4, 1, f) != 1 || nv != kRefVariants) {
     std::fclose(f);
-    throw std::runtime_error("not a BMRF reference file");
+    throw std::runtime_error("not a BMRF reference file (or wrong variant count; re-run export_weights.py)");
   }
   Reference ref;
   ref.vocab = static_cast<int>(v);
   ref.ids.resize(n);
-  ref.logits_fp32.resize(static_cast<size_t>(n) * v);
-  ref.logits_int8.resize(static_cast<size_t>(n) * v);
-  bool ok = std::fread(ref.ids.data(), 4, n, f) == n &&
-            std::fread(ref.logits_fp32.data(), 4, ref.logits_fp32.size(), f) == ref.logits_fp32.size() &&
-            std::fread(ref.logits_int8.data(), 4, ref.logits_int8.size(), f) == ref.logits_int8.size();
+  bool ok = std::fread(ref.ids.data(), 4, n, f) == n;
+  ref.logits.resize(nv);
+  for (auto& l : ref.logits) {
+    l.resize(static_cast<size_t>(n) * v);
+    ok = ok && std::fread(l.data(), 4, l.size(), f) == l.size();
+  }
   std::fclose(f);
   if (!ok) throw std::runtime_error("reference file is truncated");
   return ref;

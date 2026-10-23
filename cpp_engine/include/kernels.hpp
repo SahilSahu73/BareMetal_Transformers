@@ -61,15 +61,58 @@ size_t& gemv_parallel_threshold();
 using GemvQ8 = void (*)(int N, int K, const int8_t* Q, const float* scales, const float* x, float* y);
 void gemv_q8_naive(int N, int K, const int8_t* Q, const float* scales, const float* x, float* y);
 
+// ---- INT8 ------------------------------------------------------------------------------------
+// W8A32 batch: Y[M,N] = X[M,K] * dequant(Q[N,K])^T. The SIMD version dequantises while packing B
+// into the FP32 micro-kernel's panels, so it runs at FP32 GEMM speed with 4x less weight traffic.
+using GemmNtQ8 = void (*)(int M, int N, int K, const float* X, const int8_t* Q, const float* wscales, float* Y);
+void gemm_nt_q8_naive(int M, int N, int K, const float* X, const int8_t* Q, const float* wscales, float* Y);
+void gemm_nt_q8_simd(int M, int N, int K, const float* X, const int8_t* Q, const float* wscales, float* Y);
+void gemv_q8_simd(int N, int K, const int8_t* Q, const float* scales, const float* x, float* y);
+
+// W8A8: activations are quantised too (one scale per vector / token row), so the inner loop is a
+// pure integer dot product accumulated in int32 and rescaled once per output:
+//   y[n] = wscales[n] * xscale * sum_k Q[n,k] * xq[k]
+using GemvQ8A8 = void (*)(int N, int K, const int8_t* Q, const float* wscales, const int8_t* xq, float xscale, float* y);
+using GemmNtQ8A8 = void (*)(int M, int N, int K, const int8_t* Xq, const float* xscales, const int8_t* Q,
+                            const float* wscales, float* Y);
+void gemv_q8a8_naive(int N, int K, const int8_t* Q, const float* wscales, const int8_t* xq, float xscale, float* y);
+void gemv_q8a8_simd(int N, int K, const int8_t* Q, const float* wscales, const int8_t* xq, float xscale, float* y);
+void gemm_nt_q8a8_naive(int M, int N, int K, const int8_t* Xq, const float* xscales, const int8_t* Q,
+                        const float* wscales, float* Y);
+void gemm_nt_q8a8_simd(int M, int N, int K, const int8_t* Xq, const float* xscales, const int8_t* Q,
+                       const float* wscales, float* Y);
+
+// Attention inner loops over one head (n = head_dim): scores = q . k and out += weight * v,
+// for FP32 and for INT8 cached vectors (the caller applies the per-vector scale).
+using DotF32 = float (*)(const float* a, const float* b, int n);
+using AxpyF32 = void (*)(float* y, float alpha, const float* x, int n);  // y += alpha * x
+using DotF32I8 = float (*)(const float* a, const int8_t* b, int n);
+using AxpyF32I8 = void (*)(float* y, float alpha, const int8_t* x, int n);
+float dot_f32_naive(const float* a, const float* b, int n);
+void axpy_f32_naive(float* y, float alpha, const float* x, int n);
+float dot_f32_i8_naive(const float* a, const int8_t* b, int n);
+void axpy_f32_i8_naive(float* y, float alpha, const int8_t* x, int n);
+float dot_f32(const float* a, const float* b, int n);
+void axpy_f32(float* y, float alpha, const float* x, int n);
+float dot_f32_i8(const float* a, const int8_t* b, int n);
+void axpy_f32_i8(float* y, float alpha, const int8_t* x, int n);
+
 // The model calls matrix-vector products through this table, so a benchmark can swap
 // kernel implementations without touching the transformer.
 struct KernelTable {
   GemvF32 gemv_f32;
   GemvQ8 gemv_q8;
   GemmNtF32 gemm_nt_f32;
+  GemmNtQ8 gemm_nt_q8;
+  GemvQ8A8 gemv_q8a8;
+  GemmNtQ8A8 gemm_nt_q8a8;
+  DotF32 dot_f32;
+  AxpyF32 axpy_f32;
+  DotF32I8 dot_f32_i8;
+  AxpyF32I8 axpy_f32_i8;
 };
 KernelTable naive_kernels();
-KernelTable optimized_kernels();  // SIMD FP32 kernels (INT8 stays scalar until the INT8 kernels land)
+KernelTable optimized_kernels();  // SIMD kernels for every precision
 
 // ---- element-wise / row-wise ops ---------------------------------------------------------
 // y = gamma * x / sqrt(mean(x^2) + eps)

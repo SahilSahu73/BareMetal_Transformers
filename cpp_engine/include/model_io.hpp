@@ -53,12 +53,13 @@ class ModelFile {
   bool mapped_ = false;
 };
 
-// Reference data written next to a model by the exporter, used by the tests.
+// Reference data written next to a model by the exporter, used by the tests. Each variant holds the
+// logits [n, vocab] PyTorch produced under one numeric mode (order = export_weights.REFERENCE_VARIANTS).
+enum RefVariant { kRefFp32 = 0, kRefW8, kRefW8A8, kRefW8Kv8, kRefFp32Kv8, kRefVariants };
 struct Reference {
   std::vector<int32_t> ids;
   int vocab = 0;
-  std::vector<float> logits_fp32;  // [n, vocab] from PyTorch with FP32 weights
-  std::vector<float> logits_int8;  // [n, vocab] from PyTorch with dequantised INT8 weights
+  std::vector<std::vector<float>> logits;  // [kRefVariants][n * vocab]
 };
 Reference load_reference(const std::string& path);
 

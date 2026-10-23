@@ -199,10 +199,24 @@ void pack_b_panel(const float* B, int ldb, bool trans, int j0, int nr, int pc, i
   }
 }
 
+// INT8 weights packed straight into FP32 panels: B[k, j] = Q[j, k] * scale[j]. The dequantisation
+// rides along with the copy we already do, so the micro-kernel is the unchanged FP32 one.
+void pack_b_panel_q8(const int8_t* Q, const float* scales, int ldq, int j0, int nr, int pc, int kc, float* dst) {
+  for (int c = 0; c < nr; ++c) {
+    const int8_t* src = Q + static_cast<size_t>(j0 + c) * ldq + pc;
+    const float sc = scales[j0 + c];
+    for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = static_cast<float>(src[p]) * sc;
+  }
+  for (int c = nr; c < NR; ++c)
+    for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = 0.f;
+}
+
 }  // namespace
 
-void gemm_simd_ld(int M, int N, int K, const float* A, int lda, const float* B, int ldb,
-                  bool b_transposed, float* C, int ldc, const GemmBlocking& blk) {
+// B is read either as floats (B / ldb / b_transposed) or, when bq != nullptr, as the int8 matrix
+// Q[N, K] with per-row scales (always "transposed": a weight matrix).
+static void gemm_core(int M, int N, int K, const float* A, int lda, const float* B, int ldb, bool b_transposed,
+                      const int8_t* bq, const float* bscales, float* C, int ldc, const GemmBlocking& blk) {
   if (M <= 0 || N <= 0) return;
   if (K <= 0) {
     for (int i = 0; i < M; ++i) std::memset(C + static_cast<size_t>(i) * ldc, 0, sizeof(float) * N);
@@ -231,8 +245,12 @@ void gemm_simd_ld(int M, int N, int K, const float* A, int lda, const float* B, 
 
         BM_PRAGMA(omp for schedule(static))
         for (int jp = 0; jp < b_panels; ++jp)
-          pack_b_panel(B, ldb, b_transposed, jc + jp * NR, std::min(NR, ncur - jp * NR), pc, kcur,
-                       bpack + static_cast<size_t>(jp) * NR * kcur);
+          if (bq)
+            pack_b_panel_q8(bq, bscales, K, jc + jp * NR, std::min(NR, ncur - jp * NR), pc, kcur,
+                            bpack + static_cast<size_t>(jp) * NR * kcur);
+          else
+            pack_b_panel(B, ldb, b_transposed, jc + jp * NR, std::min(NR, ncur - jp * NR), pc, kcur,
+                         bpack + static_cast<size_t>(jp) * NR * kcur);
 
         BM_PRAGMA(omp for schedule(static))
         for (int ip = 0; ip < m_panels; ++ip)
@@ -259,6 +277,18 @@ void gemm_simd_ld(int M, int N, int K, const float* A, int lda, const float* B, 
       }
     }
   }
+}
+
+void gemm_simd_ld(int M, int N, int K, const float* A, int lda, const float* B, int ldb,
+                  bool b_transposed, float* C, int ldc, const GemmBlocking& blk) {
+  gemm_core(M, N, K, A, lda, B, ldb, b_transposed, nullptr, nullptr, C, ldc, blk);
+}
+
+void gemm_nt_q8_simd(int M, int N, int K, const float* X, const int8_t* Q, const float* wscales, float* Y) {
+  if (M == 1)
+    gemv_q8_simd(N, K, Q, wscales, X, Y);
+  else
+    gemm_core(M, N, K, X, K, nullptr, K, true, Q, wscales, Y, N, GemmBlocking{});
 }
 
 void gemm_simd(int M, int N, int K, const float* A, const float* B, float* C, bool b_transposed,
@@ -381,7 +411,47 @@ void gemv_f32_simd(int N, int K, const float* W, const float* x, float* y) {
   for (int b = 0; b < blocks; ++b) gemv_rows(W, K, x, y, b * 4, std::min(N, b * 4 + 4));
 }
 
-KernelTable optimized_kernels() { return {gemv_f32_simd, gemv_q8_naive, gemm_nt_simd}; }
+float dot_f32(const float* a, const float* b, int n) {
+  int i = 0;
+  float s = 0.f;
+#if BM_AVX2
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0;
+  for (; i + 16 <= n; i += 16) {
+    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
+  }
+  for (; i + 8 <= n; i += 8) acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+  __m128 h = _mm_add_ps(_mm256_castps256_ps128(_mm256_add_ps(acc0, acc1)), _mm256_extractf128_ps(_mm256_add_ps(acc0, acc1), 1));
+  h = _mm_hadd_ps(h, h);
+  h = _mm_hadd_ps(h, h);
+  s = _mm_cvtss_f32(h);
+#elif BM_NEON
+  float32x4_t acc = vdupq_n_f32(0.f), acc1 = acc;
+  for (; i + 8 <= n; i += 8) {
+    acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+    acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+  }
+  s = vaddvq_f32(vaddq_f32(acc, acc1));
+#endif
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
+}
+
+void axpy_f32(float* y, float alpha, const float* x, int n) {
+  int i = 0;
+#if BM_AVX2
+  const __m256 va = _mm256_set1_ps(alpha);
+  for (; i + 8 <= n; i += 8) _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+#elif BM_NEON
+  for (; i + 4 <= n; i += 4) vst1q_f32(y + i, vfmaq_n_f32(vld1q_f32(y + i), vld1q_f32(x + i), alpha));
+#endif
+  for (; i < n; ++i) y[i] += alpha * x[i];
+}
+
+KernelTable optimized_kernels() {
+  return {gemv_f32_simd, gemv_q8_simd, gemm_nt_simd, gemm_nt_q8_simd, gemv_q8a8_simd, gemm_nt_q8a8_simd,
+          dot_f32,       axpy_f32,     dot_f32_i8,   axpy_f32_i8};
+}
 
 const char* simd_isa() {
 #if BM_AVX2
