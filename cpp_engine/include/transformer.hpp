@@ -1,0 +1,68 @@
+// Decoder-only transformer forward pass for autoregressive generation, with a KV-cache.
+#pragma once
+#include <cstdint>
+#include <vector>
+
+#include "kernels.hpp"
+#include "model_io.hpp"
+#include "tensor.hpp"
+
+namespace bm {
+
+class Transformer {
+ public:
+  explicit Transformer(const ModelFile& model, KernelTable kernels = naive_kernels());
+
+  // Feeds one token at the current position, appends its K/V to the cache and returns the
+  // next-token logits (vocab floats, valid until the next call). Throws past max_seq.
+  const float* forward(int token);
+
+  // Processes n prompt tokens at once: every weight matrix is applied to all n tokens with a
+  // single GEMM (compute bound) instead of n matrix-vector products (memory bound). Appends the
+  // n positions to the KV-cache and returns the logits of the last token, exactly as n calls of
+  // forward() would. May follow earlier tokens (the sequence continues from pos()).
+  const float* prefill(const int* tokens, int n);
+
+  void reset() { pos_ = 0; }  // start a new sequence (the cache is simply overwritten)
+  int pos() const { return pos_; }
+  const ModelConfig& config() const { return cfg_; }
+  size_t arena_bytes() const { return arena_.used(); }
+  size_t kv_cache_bytes() const { return kv_bytes_; }
+
+ private:
+  void linear(const Matrix& w, const float* x, float* y) const;
+  void linear_batch(const Matrix& w, const float* X, int m, float* Y) const;  // Y[m, rows] = X[m, cols] W^T
+  void embed(int token, float* out) const;
+  void attention(int layer, int pos, const float* q, float* out);  // q, out: d_model floats
+
+  const ModelFile& m_;
+  ModelConfig cfg_;
+  KernelTable kern_;
+  Arena arena_;
+  int pos_ = 0;
+  size_t kv_bytes_ = 0;
+
+  // activations, all carved out of the arena
+  float *x_, *xb_, *q_, *k_, *v_, *att_out_, *scores_, *hidden_, *logits_;
+  float *px_, *pxb_, *pq_, *pk_, *pv_, *patt_, *phid_;  // prefill: the same buffers, one row per token
+  float *rope_cos_, *rope_sin_;      // [max_seq, head_dim / 2]
+  std::vector<Tensor> kcache_, vcache_;  // per layer: [max_seq, d_model]
+};
+
+// Temperature / top-k / top-p sampling with a seeded xorshift RNG (reproducible runs).
+class Sampler {
+ public:
+  Sampler(int vocab, float temperature, int top_k, float top_p, uint64_t seed);
+  int sample(const float* logits);  // temperature <= 0 means greedy
+
+ private:
+  float uniform();
+  int vocab_;
+  float temperature_, top_p_;
+  int top_k_;
+  uint64_t state_;
+  std::vector<int> idx_;
+  std::vector<float> probs_;
+};
+
+}  // namespace bm
