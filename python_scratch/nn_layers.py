@@ -137,7 +137,7 @@ class RMSNorm(Module):
         return self.inv_rms * (g - self.xhat * (g * self.xhat).mean(axis=-1, keepdims=True))
 
 
-_SQRT_2_OVER_PI = np.sqrt(2.0 / np.pi)
+_SQRT_2_OVER_PI = float(np.sqrt(2.0 / np.pi))  # python floats are "weak" scalars: float32 stays float32
 _GELU_C = 0.044715
 
 

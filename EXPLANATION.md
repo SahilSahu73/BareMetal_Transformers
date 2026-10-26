@@ -355,3 +355,41 @@ Each phase ends with something runnable and a commit, so the history shows the p
 7. **Commits:** should I commit at the end of each phase (as you), or leave all git operations to you?
 
 Once you've read this and confirmed (or changed) these points, I'll start Phase 1.
+
+---
+
+## 11. Extension: Low-Precision Edge Training and a Ternary Accelerator Model
+
+This section was added after the nine phases. It asks a different question from the inference engine: *what does it take to **train** with 2-bit weights and INT8 everything else, and what would that save in silicon?* Code: `python_scratch/low_bit_training.py`, `hardware_profiler.py`, `lowbit_native.py`; `cpp_engine/{include/ternary.hpp, src/kernels_ternary_accum.cpp, src/ternary.cpp, src/lowbit_train.cpp, src/lowbit_capi.cpp, src/benchmark_lowbit.cpp}`; tests in `tests/test_lowbit_training.py` and `cpp_engine/tests/test_ternary.cpp`.
+
+### 11.1 Why training is harder than inference
+
+Inference quantisation freezes the weights. Training breaks three things:
+
+1. **The quantiser has zero gradient almost everywhere** (round() is a staircase). Fix: the **straight-through estimator**: forward with $\hat W = Q(W)$, backward as if $Q$ were the identity, $\partial L/\partial W := \partial L/\partial \hat W$. The gradient is applied to a latent higher-precision copy $W$ (the *master weights*), and only the forward pass sees $\hat W$.
+2. **Updates are tiny, grids are coarse.** An update $\Delta w$ smaller than half a grid step rounds back to the same value every time: training silently stalls. Fix: **stochastic rounding** (below).
+3. **Activations must be remembered.** Backprop needs every layer's forward input, so activation memory grows with batch × depth and dominates training RAM. Fix: **cache them as INT8**, dequantise during backward.
+
+### 11.2 Ternary weights (BitNet b1.58 "absmean")
+
+$\gamma = \tfrac1n\sum|W_{ij}|,\qquad \hat W = \operatorname{clip}(\operatorname{round}(W/\gamma),-1,1)\in\{-1,0,+1\}$, used as $y \approx \gamma\,(\hat W x)$. Three values need $\log_2 3 \approx 1.58$ bits; we store 2: four weights per byte (`w0 | w1<<2 | w2<<4 | w3<<6`, codes `00=0, 01=+1, 10=-1`), 16× smaller than FP32.
+
+### 11.3 Why the matmul needs no multiplier
+
+With $w\in\{-1,0,+1\}$: $\;w\cdot x \;=\; \{+x,\,-x,\,0\}$. A dot product becomes "add some activations, subtract others, skip the zeros". On an FPGA that is an adder/subtractor in a LUT instead of a DSP multiplier. In the AVX2 kernel each 32-weight step does: expand the 8 packed bytes to two byte masks (`pshufb`, `and`, `cmpeq`), then `d = (x & pos) − (x & neg)`, then add the 32 bytes with `psadbw` (after a `^0x80` bias so they are unsigned). No `pmaddubsw`, no `fmadd`. `scripts/check_multiplierless.sh` disassembles `kernels_ternary_accum.cpp.o` in CTest and fails if any multiplier-class instruction appears; a negative control proves the check can fail. After the integer sum there is **one** rescale multiply per *output* ($\gamma\cdot s_x$), O(N) instead of O(NK).
+
+### 11.4 Stochastic rounding is unbiased
+
+$\operatorname{SR}(x)=\lfloor x+u\rfloor,\; u\sim U[0,1)$. Write $x=n+f$ with $n=\lfloor x\rfloor$, $f\in[0,1)$. Then $\operatorname{SR}(x)=n+1$ exactly when $u\ge 1-f$, probability $f$, else $n$. So $\mathbb E[\operatorname{SR}(x)] = n(1-f)+(n+1)f = n+f = x$. Round-to-nearest of $x=0.3$ is always 0, so a thousand updates of $0.3$ LSB add up to nothing; SR returns 1 with probability 0.3 and the sum is about 300. The cost is variance: $\operatorname{Var}=f(1-f)\le\tfrac14$ LSB². Whether the bias or the variance matters more is an empirical question, and the experiments show both outcomes (README).
+
+### 11.5 Block floating point gradients
+
+Each block of 32 gradient values shares a power-of-two exponent $e=\lceil\log_2(\max|g|/q_{\max})\rceil$ and stores signed mantissas $m=\operatorname{SR}(g/2^e)$ in 8 (or 4) bits. Dequantisation is a shift. Storage ≈ 1.03 bytes per gradient instead of 4. The exponent is computed with `frexp` so it is exact at powers of two (a naive `ceil(log2())` is off by one there; a test pins that).
+
+### 11.6 INT8 activation caching
+
+The INT8 tensor that the forward matmul already consumed (one scale per row) is simply kept instead of the FP32 input: caching is free. GELU, RMSNorm, and attention (q, k, v as INT8, the softmax matrix as UINT8) are compressed the same way. During backward, $dW = \hat x^\top\,dy$ uses $\hat x = q\cdot s$, dequantised on the fly, so one layer's FP32 copy exists at a time.
+
+### 11.7 What the hardware profiler does and does not claim
+
+`hardware_profiler.py` computes, for a given model/batch: (a) bytes crossing the DRAM boundary per training step by a tiling model with a finite SRAM; (b) resident memory by tensor class; (c) DSP/LUT counts for 16×16, 32×32, 64×64 PE arrays from per-PE assumptions listed in the code. These are **analytical models with stated parameters, not synthesis results**. The footprint model is validated against the real training loop (it predicts the measured activation cache to within 1.5%). Everything labelled *measured* in the README was measured on this machine by running the code.

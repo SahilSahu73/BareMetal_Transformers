@@ -10,7 +10,7 @@ torch = ["torch"]
 dev = ["pytest", "matplotlib"]
 
 [tool.pytest.ini_options]
-testpaths = ["python_scratch"]
+testpaths = ["python_scratch", "tests"]
 pythonpath = ["python_scratch"]
 
 [[tool.uv.index]]

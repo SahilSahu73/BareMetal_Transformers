@@ -56,7 +56,7 @@ class MultiHeadCausalAttention(Module):
         q = self.rope.forward(self._split(c["wq"].forward(x)))
         k = self.rope.forward(self._split(c["wk"].forward(x)))
         v = self._split(c["wv"].forward(x))
-        self.scale = 1.0 / np.sqrt(self.dh)
+        self.scale = x.dtype.type(1.0 / np.sqrt(self.dh))  # same dtype as x: a float64 scalar would promote float32 activations
         scores = (q @ k.swapaxes(-1, -2)) * self.scale
         scores = np.where(np.triu(np.ones((T, T), dtype=bool), 1), -np.inf, scores)
         P = softmax(scores)  # masked entries are exactly 0

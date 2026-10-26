@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # NumPy layers vs PyTorch autograd, optimisers, model parity, binary export format.
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install numpy pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build the C++ low-bit library (bit-exact cross-checks against the NumPy reference)
+        run: |
+          cmake -S cpp_engine -B cpp_engine/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp_engine/build -j --target bmlowbit
+      - name: Gradient, optimiser, parity, export and low-precision training tests
+        run: python -m pytest -q -rs
+
+  # The C++ tests compare the engine against PyTorch's logits, so they need a model file. Weights do
+  # not have to be trained for that: a random-weight tiny model exercises every kernel and code
+  # path. The files are platform independent, so every C++ job below reuses this one.
+  model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Export a random-weight tiny model with PyTorch reference logits
+        run: |
+          mkdir -p checkpoints
+          python python_scratch/random_checkpoint.py --config tiny --out checkpoints/random_tiny.pt
+          python python_scratch/export_weights.py --ckpt checkpoints/random_tiny.pt --name tiny --quantize-int8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tiny-model
+          path: |
+            checkpoints/tiny_fp32.bin
+            checkpoints/tiny_int8.bin
+            checkpoints/tiny_reference.bin
+            checkpoints/val_tokens.bin
+
+  # Native x86-64 build (AVX2 + FMA when the runner has them) plus a benchmark smoke run.
+  x86:
+    needs: model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tiny-model
+          path: checkpoints
+      - name: Configure and build
+        run: |
+          cmake -S cpp_engine -B build -DCMAKE_BUILD_TYPE=Release -DBM_REFERENCE_SMOOTH_ONLY=ON
+          cmake --build build -j
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Smoke-run the tools
+        run: |
+          ./build/benchmark_lowbit --reps 3
+          ./build/benchmark_transformer --gemm --gemv --size 256 --naive-max 256 --reps 2
+          ./build/generate --weights checkpoints/tiny_int8.bin --prompt "ROMEO:" -n 32 --act w8a8 --kv-int8
+          ./build/eval_perplexity --weights checkpoints/tiny_fp32.bin --val checkpoints/val_tokens.bin --windows 4
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer over every kernel (unaligned loads, tail loops).
+  sanitizers:
+    needs: model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tiny-model
+          path: checkpoints
+      - name: Build with sanitizers
+        run: |
+          cmake -S cpp_engine -B build -DCMAKE_BUILD_TYPE=Debug -DBM_SANITIZE=ON -DBM_REFERENCE_SMOOTH_ONLY=ON
+          cmake --build build -j
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure
+
+  # AArch64 / NEON cross-compiled on x86 and executed under qemu user-mode emulation.
+  # Verifies correctness of the NEON kernels (not their speed).
+  arm-qemu:
+    needs: model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tiny-model
+          path: checkpoints
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-aarch64-linux-gnu qemu-user
+      - name: Cross-compile
+        run: |
+          cmake -S cpp_engine -B build-arm \
+            -DCMAKE_TOOLCHAIN_FILE=$PWD/cpp_engine/cmake/aarch64-linux-gnu.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DBM_REFERENCE_SMOOTH_ONLY=ON
+          cmake --build build-arm -j
+      - name: Tests under qemu
+        run: ctest --test-dir build-arm --output-on-failure
+
+  # Real ARM hardware (GitHub-hosted arm64 runner): native NEON build, tests and a benchmark smoke run.
+  arm-native:
+    needs: model
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tiny-model
+          path: checkpoints
+      - name: Configure and build
+        run: |
+          cmake -S cpp_engine -B build -DCMAKE_BUILD_TYPE=Release -DBM_REFERENCE_SMOOTH_ONLY=ON
+          cmake --build build -j
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Smoke-run the benchmark
+        run: ./build/benchmark_transformer --gemm --gemv --size 256 --naive-max 256 --reps 2

@@ -1,0 +1,25 @@
+phase,shape,kernel,threads,bytes_per_weight,ms,weight_gbs,gmacs
+decode,512x512,fp32 SIMD,8,4.00,0.03842,27.292,6.823
+decode,512x512,int8 W8A8 (madd),8,1.00,0.00870,30.145,30.145
+decode,512x512,ternary 2-bit (add/sub only),8,0.25,0.00267,24.499,97.998
+decode,2048x512,fp32 SIMD,8,4.00,0.13753,30.497,7.624
+decode,2048x512,int8 W8A8 (madd),8,1.00,0.03212,32.646,32.646
+decode,2048x512,ternary 2-bit (add/sub only),8,0.25,0.00847,30.968,123.872
+decode,512x2048,fp32 SIMD,8,4.00,0.13323,31.483,7.871
+decode,512x2048,int8 W8A8 (madd),8,1.00,0.03421,30.648,30.648
+decode,512x2048,ternary 2-bit (add/sub only),8,0.25,0.00972,26.975,107.900
+decode,4096x4096,fp32 SIMD,8,4.00,2.17438,30.863,7.716
+decode,4096x4096,int8 W8A8 (madd),8,1.00,0.53481,31.371,31.371
+decode,4096x4096,ternary 2-bit (add/sub only),8,0.25,0.14654,28.622,114.488
+prefill,512x512,fp32 SIMD,8,4.00,0.15521,6.756,216.191
+prefill,512x512,int8 W8A8 (madd),8,1.00,0.09766,2.684,343.584
+prefill,512x512,ternary 2-bit (add/sub only),8,0.25,0.09909,0.661,338.616
+prefill,2048x512,fp32 SIMD,8,4.00,0.63627,6.592,210.943
+prefill,2048x512,int8 W8A8 (madd),8,1.00,0.27233,3.850,492.846
+prefill,2048x512,ternary 2-bit (add/sub only),8,0.25,0.49116,0.534,273.268
+prefill,512x2048,fp32 SIMD,8,4.00,0.86029,4.875,156.015
+prefill,512x2048,int8 W8A8 (madd),8,1.00,0.44979,2.331,298.401
+prefill,512x2048,ternary 2-bit (add/sub only),8,0.25,0.68944,0.380,194.676
+prefill,4096x4096,fp32 SIMD,8,4.00,10.53618,6.369,203.820
+prefill,4096x4096,int8 W8A8 (madd),8,1.00,6.44063,2.605,333.428
+prefill,4096x4096,ternary 2-bit (add/sub only),8,0.25,9.89690,0.424,216.986

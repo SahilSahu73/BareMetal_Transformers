@@ -7,3 +7,5 @@ checkpoints/
 data/
 cpp_engine/build/
 *.bin
+build*/
+docs/profiler_run.log
